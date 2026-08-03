@@ -154,26 +154,51 @@ st.markdown(f"""
 """, unsafe_allow_html=True)
 
 # -----------------------------------------------------------------------------
-# 9. MAPA DINÁMICO
+# 9. MAPA DINÁMICO (A PRUEBA DE FALLOS)
 # -----------------------------------------------------------------------------
 m = folium.Map(location=[lat_center, lon_center], zoom_start=10, tiles="CartoDB positron")
 
+# Función segura para obtener el URL del mapa de GEE
+def get_ee_url(ee_image, vis_params):
+    try:
+        map_id_dict = ee.Image(ee_image).getMapId(vis_params)
+        return map_id_dict['tile_fetcher'].url_format
+    except Exception as e:
+        st.error(f"Error generando capa GEE: {e}")
+        return ""
+
+# Capa 1: DEM
 dem_vis = {'min': 200, 'max': 2500, 'palette': ['006600', '002200', 'fff700', 'ab0000', 'b8b8b8', 'ffffff']}
-folium.TileLayer(
-    tiles=ee.Image(dem_cuenca).getMapId(dem_vis)['tile_fetcher'].url_format, 
-    attr='Google Earth Engine', name='DEM SRTM', overlay=True, opacity=dem_opacity
-).add_to(m)
+dem_url = get_ee_url(dem_cuenca, dem_vis)
+if dem_url:
+    folium.TileLayer(
+        tiles=dem_url, attr='Google Earth Engine', name='DEM SRTM', 
+        overlay=True, opacity=dem_opacity
+    ).add_to(m)
 
-# El borde de la cuenca se pinta del color de la alerta actual
-folium.TileLayer(
-    tiles=ee.Image().paint(ee.FeatureCollection([cuenca_feat]), 0, 4).getMapId({'palette': color_hex})['tile_fetcher'].url_format, 
-    attr='GEE', name=f'Límite Río Cahabón ({estado})', overlay=True
-).add_to(m)
+# Capa 2: Borde Dinámico de la Cuenca
+# Convertimos el polígono a una imagen vacía y le pintamos los bordes
+imagen_vacia = ee.Image().byte()
+borde_cuenca = imagen_vacia.paint(
+    featureCollection=ee.FeatureCollection([cuenca_feat]),
+    color=1,
+    width=4
+)
+# Para pintar el borde usamos la paleta con el color dinámico del estado
+borde_url = get_ee_url(borde_cuenca, {'palette': [color_hex]})
+if borde_url:
+    folium.TileLayer(
+        tiles=borde_url, attr='GEE', name=f'Límite Río Cahabón ({estado})', overlay=True
+    ).add_to(m)
 
+# Marcador Informativo
 folium.Marker(
-    [lat_center, lon_center], popup=f"Estado: {estado}<br>Lluvia: {precip_pronostico}mm",
+    [lat_center, lon_center], 
+    popup=f"Estado: {estado}<br>Lluvia: {precip_pronostico}mm",
     icon=folium.Icon(color="red" if color_hex=="#E74C3C" else "blue", icon="info-sign")
 ).add_to(m)
 
 folium.LayerControl().add_to(m)
+
+# Mostramos el mapa
 st_folium(m, width="100%", height=550)
