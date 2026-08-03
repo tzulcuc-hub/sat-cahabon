@@ -25,6 +25,7 @@ st.markdown("""
 @st.cache_resource
 def init_earth_engine():
     try:
+        # Extraer secretos
         service_account_info = dict(st.secrets["gee_service_account"])
         if "private_key" in service_account_info:
             pk = service_account_info["private_key"].replace("\\n", "\n").strip("'\"")
@@ -32,17 +33,16 @@ def init_earth_engine():
             
         scopes = ["https://www.googleapis.com/auth/earthengine", "https://www.googleapis.com/auth/devstorage.full_control"]
         
-        # Esta es la librería que requiere google-auth
+        # Generar credenciales
         from google.oauth2 import service_account
         credentials = service_account.Credentials.from_service_account_info(service_account_info, scopes=scopes)
         
+        # Inicializar GEE extrayendo el ID real desde el archivo JSON
         project_id = service_account_info.get("project_id")
         ee.Initialize(credentials, project=project_id)
         
     except Exception as e:
-        # Si algo falla, Streamlit mostrará el error exacto en rojo
         st.error(f"🚨 Error crítico al leer los Secrets: {e}")
-        st.info("Verifica que el nombre en st.secrets coincida con el encabezado [gee_service_account] y que instalaste google-auth.")
         st.stop()
 
 init_earth_engine()
