@@ -85,21 +85,32 @@ def cargar_datos():
 df_historico, umbral_amarilla, umbral_naranja, umbral_roja = cargar_datos()
 
 # -----------------------------------------------------------------------------
-# 5. PRONÓSTICO EN TIEMPO REAL (OPEN-METEO)
+# 5. PRONÓSTICO EN TIEMPO REAL (OPEN-METEO 5 DÍAS)
 # -----------------------------------------------------------------------------
 @st.cache_data(ttl=3600)
-def obtener_pronostico_real(lat, lon):
+def obtener_pronostico_5_dias(lat, lon):
     try:
-        url = f"https://api.open-meteo.com/v1/forecast?latitude={lat}&longitude={lon}&daily=precipitation_sum&timezone=America%2FGuatemala&forecast_days=2"
+        url = f"https://api.open-meteo.com/v1/forecast?latitude={lat}&longitude={lon}&daily=precipitation_sum&timezone=America%2FGuatemala&forecast_days=5"
         respuesta = requests.get(url).json()
-        lluvia_hoy = respuesta['daily']['precipitation_sum'][0]
-        lluvia_manana = respuesta['daily']['precipitation_sum'][1]
-        return lluvia_hoy, lluvia_manana
+        fechas = respuesta['daily']['time']
+        lluvias = respuesta['daily']['precipitation_sum']
+        
+        # Crear DataFrame para el pronóstico
+        df_pronostico = pd.DataFrame({'Fecha': fechas, 'Lluvia Diaria (mm)': lluvias})
+        # Calcular la lluvia acumulada (suma progresiva)
+        df_pronostico['Acumulado (mm)'] = df_pronostico['Lluvia Diaria (mm)'].cumsum()
+        
+        # Extraemos variables para el panel lateral
+        lluvia_hoy = lluvias[0]
+        lluvia_manana = lluvias[1]
+        # El pronóstico de alerta será la lluvia máxima de las próximas 48h o el acumulado si es extremo
+        alerta_trigger = max(lluvia_hoy, lluvia_manana)
+        
+        return df_pronostico, lluvia_hoy, lluvia_manana, alerta_trigger
     except Exception:
-        return 0.0, 0.0
+        return pd.DataFrame(), 0.0, 0.0, 0.0
 
-lluvia_hoy, lluvia_manana = obtener_pronostico_real(lat_center, lon_center)
-precip_pronostico = max(lluvia_hoy, lluvia_manana)
+df_pronostico, lluvia_hoy, lluvia_manana, precip_pronostico = obtener_pronostico_5_dias(lat_center, lon_center)
 
 # -----------------------------------------------------------------------------
 # 6. LÓGICA DE ALERTA Y SEMÁFORO
@@ -172,20 +183,52 @@ with tab1:
         st_folium(m, width="100%", height=450)
 
     with col_grafico:
-        # GRÁFICO HISTOGRAMA: PRONÓSTICO VS UMBRALES
-        st.markdown("<h4 style='text-align: center;'>Acercamiento a Umbrales Críticos</h4>", unsafe_allow_html=True)
-        fig_bar = go.Figure()
-        fig_bar.add_trace(go.Bar(x=['Pronóstico Diario'], y=[precip_pronostico], marker_color=color_hex, text=[f"{precip_pronostico} mm"], textposition='auto'))
+        with col_grafico:
+        st.markdown("<h4 style='text-align: center;'>🌧️ Pronóstico Extendido y Saturación (5 Días)</h4>", unsafe_allow_html=True)
+        st.caption("Evalúa el impacto de la lluvia acumulada sobre los umbrales críticos de la cuenca.")
         
-        # Líneas de umbral
-        fig_bar.add_hline(y=umbral_amarilla, line_dash="dash", line_color="#F1C40F", annotation_text=f"P90 ({umbral_amarilla:.1f}mm)")
-        fig_bar.add_hline(y=umbral_naranja, line_dash="dash", line_color="#E67E22", annotation_text=f"P95 ({umbral_naranja:.1f}mm)")
-        fig_bar.add_hline(y=umbral_roja, line_dash="dash", line_color="#E74C3C", annotation_text=f"P99 ({umbral_roja:.1f}mm)")
-        
-        fig_bar.update_layout(yaxis_title="Precipitación (mm)", height=400, showlegend=False, template="plotly_white")
-        # Asegurar que el eje Y siempre muestre hasta la alerta roja, o más si la lluvia la supera
-        fig_bar.update_yaxes(range=[0, max(umbral_roja + 20, precip_pronostico + 20)])
-        st.plotly_chart(fig_bar, use_container_width=True)
+        if not df_pronostico.empty:
+            import plotly.graph_objects as go
+            from plotly.subplots import make_subplots
+
+            # Crear un gráfico con doble eje Y
+            fig_5d = make_subplots(specs=[[{"secondary_y": True}]])
+
+            # 1. Añadir barras para la lluvia diaria
+            fig_5d.add_trace(
+                go.Bar(x=df_pronostico['Fecha'], y=df_pronostico['Lluvia Diaria (mm)'], 
+                       name="Lluvia Diaria", marker_color='#3498DB', opacity=0.7),
+                secondary_y=False,
+            )
+
+            # 2. Añadir línea para la lluvia acumulada
+            fig_5d.add_trace(
+                go.Scatter(x=df_pronostico['Fecha'], y=df_pronostico['Acumulado (mm)'], 
+                           name="Acumulado (Saturación)", mode='lines+markers',
+                           line=dict(color='#E74C3C', width=3), marker=dict(size=8)),
+                secondary_y=False,
+            )
+
+            # 3. Líneas de umbral histórico
+            fig_5d.add_hline(y=umbral_amarilla, line_dash="dash", line_color="#F1C40F", annotation_text=f"P90 ({umbral_amarilla:.1f}mm)")
+            fig_5d.add_hline(y=umbral_naranja, line_dash="dash", line_color="#E67E22", annotation_text=f"P95 ({umbral_naranja:.1f}mm)")
+            fig_5d.add_hline(y=umbral_roja, line_dash="dash", line_color="#E74C3C", annotation_text=f"P99 ({umbral_roja:.1f}mm)")
+
+            fig_5d.update_layout(
+                height=450, 
+                showlegend=True, 
+                legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
+                template="plotly_white",
+                margin=dict(l=0, r=0, t=30, b=0)
+            )
+            
+            # Asegurar que el eje Y escale correctamente
+            max_y = max(df_pronostico['Acumulado (mm)'].max(), umbral_roja) + 15
+            fig_5d.update_yaxes(title_text="Precipitación (mm)", range=[0, max_y], secondary_y=False)
+
+            st.plotly_chart(fig_5d, use_container_width=True)
+        else:
+            st.warning("No se pudo cargar el pronóstico de 5 días.")
 
 with tab2:
     if not df_historico.empty:
