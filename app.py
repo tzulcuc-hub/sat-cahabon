@@ -7,6 +7,7 @@ import requests
 import os
 import plotly.express as px
 import plotly.graph_objects as go
+from plotly.subplots import make_subplots
 from google.oauth2 import service_account
 
 # -----------------------------------------------------------------------------
@@ -79,7 +80,6 @@ def cargar_datos():
         p99 = precip_only.quantile(0.99)
         return df, p90, p95, p99
     else:
-        # DF vacío de respaldo
         return pd.DataFrame(columns=['fecha', 'lluvia_mm']), 25.0, 45.0, 70.0
 
 df_historico, umbral_amarilla, umbral_naranja, umbral_roja = cargar_datos()
@@ -95,15 +95,11 @@ def obtener_pronostico_5_dias(lat, lon):
         fechas = respuesta['daily']['time']
         lluvias = respuesta['daily']['precipitation_sum']
         
-        # Crear DataFrame para el pronóstico
         df_pronostico = pd.DataFrame({'Fecha': fechas, 'Lluvia Diaria (mm)': lluvias})
-        # Calcular la lluvia acumulada (suma progresiva)
         df_pronostico['Acumulado (mm)'] = df_pronostico['Lluvia Diaria (mm)'].cumsum()
         
-        # Extraemos variables para el panel lateral
         lluvia_hoy = lluvias[0]
         lluvia_manana = lluvias[1]
-        # El pronóstico de alerta será la lluvia máxima de las próximas 48h o el acumulado si es extremo
         alerta_trigger = max(lluvia_hoy, lluvia_manana)
         
         return df_pronostico, lluvia_hoy, lluvia_manana, alerta_trigger
@@ -161,7 +157,6 @@ with tab1:
     col_mapa, col_grafico = st.columns([3, 2])
     
     with col_mapa:
-        # VISOR CARTOGRÁFICO A PRUEBA DE FALLOS
         m = folium.Map(location=[lat_center, lon_center], zoom_start=10, tiles="CartoDB positron")
         def get_ee_url(ee_image, vis_params):
             try:
@@ -180,36 +175,28 @@ with tab1:
 
         folium.Marker([lat_center, lon_center], popup=f"Estado: {estado}", icon=folium.Icon(color="red" if color_hex=="#E74C3C" else "blue")).add_to(m)
         folium.LayerControl().add_to(m)
-        st_folium(m, width="100%", height=450)
+        st_folium(m, width="100%", height=480)
 
     with col_grafico:
-        with col_grafico:
         st.markdown("<h4 style='text-align: center;'>🌧️ Pronóstico Extendido y Saturación (5 Días)</h4>", unsafe_allow_html=True)
         st.caption("Evalúa el impacto de la lluvia acumulada sobre los umbrales críticos de la cuenca.")
         
         if not df_pronostico.empty:
-            import plotly.graph_objects as go
-            from plotly.subplots import make_subplots
-
-            # Crear un gráfico con doble eje Y
             fig_5d = make_subplots(specs=[[{"secondary_y": True}]])
-
-            # 1. Añadir barras para la lluvia diaria
+            
             fig_5d.add_trace(
                 go.Bar(x=df_pronostico['Fecha'], y=df_pronostico['Lluvia Diaria (mm)'], 
                        name="Lluvia Diaria", marker_color='#3498DB', opacity=0.7),
                 secondary_y=False,
             )
-
-            # 2. Añadir línea para la lluvia acumulada
+            
             fig_5d.add_trace(
                 go.Scatter(x=df_pronostico['Fecha'], y=df_pronostico['Acumulado (mm)'], 
                            name="Acumulado (Saturación)", mode='lines+markers',
                            line=dict(color='#E74C3C', width=3), marker=dict(size=8)),
                 secondary_y=False,
             )
-
-            # 3. Líneas de umbral histórico
+            
             fig_5d.add_hline(y=umbral_amarilla, line_dash="dash", line_color="#F1C40F", annotation_text=f"P90 ({umbral_amarilla:.1f}mm)")
             fig_5d.add_hline(y=umbral_naranja, line_dash="dash", line_color="#E67E22", annotation_text=f"P95 ({umbral_naranja:.1f}mm)")
             fig_5d.add_hline(y=umbral_roja, line_dash="dash", line_color="#E74C3C", annotation_text=f"P99 ({umbral_roja:.1f}mm)")
@@ -222,24 +209,17 @@ with tab1:
                 margin=dict(l=0, r=0, t=30, b=0)
             )
             
-            # Asegurar que el eje Y escale correctamente
             max_y = max(df_pronostico['Acumulado (mm)'].max(), umbral_roja) + 15
             fig_5d.update_yaxes(title_text="Precipitación (mm)", range=[0, max_y], secondary_y=False)
-
             st.plotly_chart(fig_5d, use_container_width=True)
-        else:
-            st.warning("No se pudo cargar el pronóstico de 5 días.")
 
 with tab2:
     if not df_historico.empty:
         st.subheader("Evolución de Precipitación (CHIRPS)")
-        
-        # CONTROLES DE AGREGACIÓN
         c_agg1, c_agg2 = st.columns([1, 3])
         with c_agg1:
             agg_temporal = st.radio("Agregación Temporal:", ["Diario", "Mensual", "Anual"])
         
-        # LÓGICA DE AGREGACIÓN PANDAS
         df_limpio = df_historico.rename(columns={'fecha': 'Fecha', 'lluvia_mm': 'Precipitación (mm)'})
         if agg_temporal == "Diario":
             df_plot = df_limpio.copy()
@@ -248,20 +228,16 @@ with tab2:
         elif agg_temporal == "Anual":
             df_plot = df_limpio.resample('YE', on='Fecha').sum().reset_index()
 
-        # GRÁFICO DE SERIE DE TIEMPO INTERACTIVO
         fig_ts = px.line(df_plot, x='Fecha', y='Precipitación (mm)', title=f"Registro Histórico {agg_temporal} de Lluvia")
         
-        # Solo mostramos líneas de umbral en la vista diaria (porque los umbrales se calcularon por día)
         if agg_temporal == "Diario":
             fig_ts.add_hline(y=umbral_amarilla, line_dash="dot", line_color="#F1C40F", annotation_text="P90")
             fig_ts.add_hline(y=umbral_naranja, line_dash="dot", line_color="#E67E22", annotation_text="P95")
             fig_ts.add_hline(y=umbral_roja, line_dash="dot", line_color="#E74C3C", annotation_text="P99")
         
         st.plotly_chart(fig_ts, use_container_width=True)
-
         st.divider()
 
-        # TOP 10 Y BOTÓN DE DESCARGA
         c_tbl1, c_tbl2 = st.columns([2, 1])
         with c_tbl1:
             st.markdown("#### 🚨 Top 10 Eventos de Mayor Precipitación (Diaria)")
@@ -273,18 +249,14 @@ with tab2:
             st.markdown("#### 📥 Exportar Base de Datos")
             st.write("Descargue la serie temporal completa original para análisis en SIG o Excel.")
             csv_data = df_limpio.to_csv(index=False).encode('utf-8')
-            st.download_button(
-                label="Descargar Dataset CHIRPS (CSV)", 
-                data=csv_data, 
-                file_name='historico_lluvia_cahabon.csv', 
-                mime='text/csv'
-            )
+            st.download_button("Descargar Dataset CHIRPS (CSV)", data=csv_data, file_name='historico_lluvia_cahabon.csv', mime='text/csv')
 
 with tab3:
     st.subheader("Metodología y Protocolos del SAT")
     st.markdown("""
-    **¿Cómo funciona el Pronóstico?**
-    El sistema se conecta automáticamente a la API meteorológica global **Open-Meteo**. No utiliza un solo modelo, sino un *ensemble* (ensamblaje) que selecciona la mejor resolución posible para Centroamérica, integrando datos del modelo **GFS** (NOAA, Estados Unidos) y el modelo **ICON** (DWD, Alemania). Se extrae la precipitación esperada en las coordenadas exactas de la cuenca.
+    **¿Cómo funciona el Pronóstico y el Gráfico de 5 Días?**
+    El sistema se conecta automáticamente a la API meteorológica global **Open-Meteo**, la cual integra datos del modelo **GFS** (NOAA) y el modelo **ICON** (DWD). Se extrae la precipitación esperada para los próximos 5 días en la cuenca. 
+    * El gráfico muestra el pronóstico por día (barras azules) y calcula el **acumulado progresivo** (línea roja). Esto permite a las autoridades anticipar el riesgo de inundación no solo por tormentas aisladas, sino por la saturación gradual del suelo al cruzar las líneas de los umbrales críticos.
     
     **Zonas Prioritarias de Monitoreo (Río Cahabón):**
     * **Cuenca Media / Centro Urbano:** Paso del río por los municipios de San Pedro Carchá y Cobán.
