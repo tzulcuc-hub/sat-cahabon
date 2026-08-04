@@ -9,6 +9,7 @@ import plotly.express as px
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 from google.oauth2 import service_account
+from datetime import datetime, timedelta
 
 # -----------------------------------------------------------------------------
 # 1. CONFIGURACIÓN DE PÁGINA
@@ -73,20 +74,51 @@ def cargar_datos():
         df = pd.read_csv('serie_lluvia_cahabon.csv')
         if 'Unnamed: 0' in df.columns:
             df = df.drop(columns=['Unnamed: 0'])
-        df['fecha'] = pd.to_datetime(df['fecha'])
+        df['fecha'] = pd.to_datetime(df['fecha']).dt.date # Guardar como date
         
         precip_only = df[df['lluvia_mm'] > 2]['lluvia_mm']
         p90 = precip_only.quantile(0.90)
         p95 = precip_only.quantile(0.95)
         p99 = precip_only.quantile(0.99)
-        return df, p90, p95, p99
+        
+        fecha_min = df['fecha'].min()
+        fecha_max = df['fecha'].max()
+        
+        return df, p90, p95, p99, fecha_min, fecha_max
     else:
-        return pd.DataFrame(columns=['fecha', 'lluvia_mm']), 25.0, 45.0, 70.0
+        return pd.DataFrame(columns=['fecha', 'lluvia_mm']), 25.0, 45.0, 70.0, datetime.today().date(), datetime.today().date()
 
-df_historico, umbral_amarilla, umbral_naranja, umbral_roja = cargar_datos()
+df_historico, umbral_amarilla, umbral_naranja, umbral_roja, fecha_min_hist, fecha_max_hist = cargar_datos()
 
 # -----------------------------------------------------------------------------
-# 5. PRONÓSTICO EN TIEMPO REAL (OPEN-METEO 5 DÍAS)
+# 5. PANEL LATERAL: MÁQUINA DEL TIEMPO
+# -----------------------------------------------------------------------------
+with st.sidebar:
+    st.image("https://catie.ac.cr/wp-content/uploads/2023/04/Logo-CATIE-2023.png", use_container_width=True)
+    st.title("⚙️ Controles del SAT")
+    
+    st.markdown("### ⏱️ Máquina del Tiempo")
+    hoy = datetime.today().date()
+    fecha_seleccionada = st.date_input(
+        "Seleccione fecha a simular:",
+        value=hoy,
+        min_value=fecha_min_hist,
+        max_value=hoy,
+        help="Elige 'Hoy' para pronóstico real o una fecha pasada para simular eventos históricos."
+    )
+    
+    es_simulacion = fecha_seleccionada < hoy
+
+    st.divider()
+    st.markdown("### 📊 Umbrales Críticos")
+    st.caption("Percentiles Históricos (CHIRPS)")
+    st.write(f"🟡 **P90:** {umbral_amarilla:.1f} mm")
+    st.write(f"🟠 **P95:** {umbral_naranja:.1f} mm")
+    st.write(f"🔴 **P99:** {umbral_roja:.1f} mm")
+    dem_opacity = st.slider("Opacidad del DEM en el Mapa", 0.0, 1.0, 0.70)
+
+# -----------------------------------------------------------------------------
+# 6. MOTOR DE PRONÓSTICO (REAL O SIMULADO)
 # -----------------------------------------------------------------------------
 @st.cache_data(ttl=3600)
 def obtener_pronostico_5_dias(lat, lon):
@@ -95,62 +127,79 @@ def obtener_pronostico_5_dias(lat, lon):
         respuesta = requests.get(url).json()
         fechas = respuesta['daily']['time']
         lluvias = respuesta['daily']['precipitation_sum']
-        
-        df_pronostico = pd.DataFrame({'Fecha': fechas, 'Lluvia Diaria (mm)': lluvias})
-        df_pronostico['Acumulado (mm)'] = df_pronostico['Lluvia Diaria (mm)'].cumsum()
-        
-        lluvia_hoy = lluvias[0]
-        lluvia_manana = lluvias[1]
-        saturacion_5d = df_pronostico['Acumulado (mm)'].max()
-        alerta_trigger = max(lluvia_hoy, lluvia_manana)
-        
-        return df_pronostico, lluvia_hoy, lluvia_manana, saturacion_5d, alerta_trigger
+        df_pronostico = pd.DataFrame({'Fecha': pd.to_datetime(fechas).date, 'Lluvia Diaria (mm)': lluvias})
+        return df_pronostico
     except Exception:
-        return pd.DataFrame(), 0.0, 0.0, 0.0, 0.0
+        return pd.DataFrame()
 
-df_pronostico, lluvia_hoy, lluvia_manana, saturacion_5d, precip_pronostico = obtener_pronostico_5_dias(lat_center, lon_center)
+# Lógica condicional: ¿Es hoy o el pasado?
+if es_simulacion:
+    # MODO SIMULADOR: Extraer 5 días de CHIRPS desde la fecha seleccionada
+    fecha_fin_sim = fecha_seleccionada + timedelta(days=4)
+    df_simulacion = df_historico[(df_historico['fecha'] >= fecha_seleccionada) & (df_historico['fecha'] <= fecha_fin_sim)].copy()
+    
+    # Adaptar los nombres de columna al formato del gráfico
+    df_simulacion = df_simulacion.rename(columns={'fecha': 'Fecha', 'lluvia_mm': 'Lluvia Diaria (mm)'})
+    
+    # Llenar días faltantes si el dataset se corta
+    if len(df_simulacion) < 5:
+        fechas_esperadas = [fecha_seleccionada + timedelta(days=i) for i in range(5)]
+        df_simulacion = df_simulacion.set_index('Fecha').reindex(fechas_esperadas).fillna(0).reset_index(names='Fecha')
+
+    df_pronostico = df_simulacion
+    lluvia_hoy = df_pronostico.iloc[0]['Lluvia Diaria (mm)'] if len(df_pronostico) > 0 else 0
+    lluvia_manana = df_pronostico.iloc[1]['Lluvia Diaria (mm)'] if len(df_pronostico) > 1 else 0
+else:
+    # MODO REAL: API de Open Meteo
+    df_pronostico = obtener_pronostico_5_dias(lat_center, lon_center)
+    if not df_pronostico.empty:
+        lluvia_hoy = df_pronostico.iloc[0]['Lluvia Diaria (mm)']
+        lluvia_manana = df_pronostico.iloc[1]['Lluvia Diaria (mm)']
+    else:
+        lluvia_hoy, lluvia_manana = 0, 0
+
+# Calcular acumulados (sin importar si es real o simulado)
+if not df_pronostico.empty:
+    df_pronostico['Acumulado (mm)'] = df_pronostico['Lluvia Diaria (mm)'].cumsum()
+    saturacion_5d = df_pronostico['Acumulado (mm)'].max()
+    alerta_trigger = max(lluvia_hoy, lluvia_manana)
+else:
+    saturacion_5d, alerta_trigger = 0, 0
+    
+precip_pronostico = alerta_trigger
 
 # -----------------------------------------------------------------------------
-# 6. LÓGICA DE ALERTA OPERATIVA
+# 7. LÓGICA DE ALERTA OPERATIVA
 # -----------------------------------------------------------------------------
 if precip_pronostico < umbral_amarilla:
     estado, color_hex = "ESTADO NORMAL", "#28B463"
-    mensaje = "Riesgo hidrológico bajo. El pronóstico actual no supera los umbrales de peligro."
+    mensaje = "Riesgo hidrológico bajo. Los niveles de lluvia no superan los umbrales de peligro."
     protocolo = "🟢 **Monitoreo de rutina.** Revisar drenajes y cuerpos de agua, pero no se requieren acciones extraordinarias."
 elif umbral_amarilla <= precip_pronostico < umbral_naranja:
     estado, color_hex = "ALERTA AMARILLA", "#F1C40F"
-    mensaje = f"Lluvia pronosticada ({precip_pronostico}mm) supera el Percentil 90 histórico. Incremento de caudales."
+    mensaje = f"Precipitación de {precip_pronostico:.1f}mm supera el Percentil 90 histórico. Incremento de caudales."
     protocolo = "🟡 **Aviso de Prevención.** Notificar a las Coordinadoras Locales de Cobán y San Pedro Carchá. Restringir actividades en la orilla del Río Cahabón."
 elif umbral_naranja <= precip_pronostico < umbral_roja:
     estado, color_hex = "ALERTA NARANJA", "#E67E22"
-    mensaje = f"Lluvia pronosticada ({precip_pronostico}mm) supera el Percentil 95 histórico. Riesgo elevado."
+    mensaje = f"Precipitación de {precip_pronostico:.1f}mm supera el Percentil 95 histórico. Riesgo elevado."
     protocolo = "🟠 **Preparación y Alistamiento.** Identificar y preparar albergues temporales. Monitoreo constante en puentes y zonas bajas propensas a desbordamientos."
 else:
     estado, color_hex = "ALERTA ROJA (EXTREMA)", "#E74C3C"
-    mensaje = f"¡PELIGRO EXTREMO! Pronóstico ({precip_pronostico}mm) supera el Percentil 99 histórico."
+    mensaje = f"¡PELIGRO EXTREMO! Lluvia de {precip_pronostico:.1f}mm supera el Percentil 99 histórico."
     protocolo = "🔴 **Evacuación Preventiva.** Activación inmediata de sistemas de sirenas y evacuación prioritaria en las comunidades vulnerables de la cuenca baja."
 
-# -----------------------------------------------------------------------------
-# 7. INTERFAZ: PANEL LATERAL
-# -----------------------------------------------------------------------------
+# Actualizar el panel lateral con la lluvia del modo actual
 with st.sidebar:
-    st.image("https://catie.ac.cr/wp-content/uploads/2023/04/Logo-CATIE-2023.png", use_container_width=True)
-    st.title("📡 SAT Tiempo Real")
-    st.success("✅ Conectado a API Global (GFS/ICON)")
-    st.write(f"**Lluvia esperada hoy:** {lluvia_hoy} mm")
-    st.write(f"**Lluvia esperada mañana:** {lluvia_manana} mm")
-    st.divider()
-    st.markdown("### 📊 Umbrales Críticos (Río Cahabón)")
-    st.caption("Percentiles Históricos (CHIRPS)")
-    st.write(f"🟡 **P90:** {umbral_amarilla:.1f} mm")
-    st.write(f"🟠 **P95:** {umbral_naranja:.1f} mm")
-    st.write(f"🔴 **P99:** {umbral_roja:.1f} mm")
-    dem_opacity = st.slider("Opacidad del DEM en el Mapa", 0.0, 1.0, 0.70)
+    st.write(f"**Lluvia Día 1:** {lluvia_hoy:.1f} mm")
+    st.write(f"**Lluvia Día 2:** {lluvia_manana:.1f} mm")
 
 # -----------------------------------------------------------------------------
 # 8. ENCABEZADO Y SEMÁFORO
 # -----------------------------------------------------------------------------
 st.title("🛰️ Sistema de Alerta Temprana - Río Cahabón")
+
+modo_texto = f"📅 MODO SIMULACIÓN HISTÓRICA: {fecha_seleccionada.strftime('%Y-%m-%d')}" if es_simulacion else "🔴 EN VIVO: PRONÓSTICO METEOROLÓGICO"
+st.caption(f"**{modo_texto}**")
 
 st.markdown(f"""
 <div style="background-color: {color_hex}; padding: 15px; border-radius: 8px; color: white; text-align: center; text-shadow: 1px 1px 2px #000000;">
@@ -164,7 +213,7 @@ st.markdown(f"""
 # 9. PESTAÑAS (TABS) DEL SISTEMA
 # -----------------------------------------------------------------------------
 tab1, tab2, tab3, tab4 = st.tabs([
-    "🗺️ Visor de Riesgo y Pronóstico en Vivo", 
+    "🗺️ Visor de Riesgo y Alerta", 
     "📊 Análisis Climatológico e Histórico", 
     "🛡️ Plan de Respuesta Operativa", 
     "🔬 Ficha Técnica y Modelos"
@@ -174,14 +223,13 @@ tab1, tab2, tab3, tab4 = st.tabs([
 with tab1:
     m1, m2, m3 = st.columns(3)
     m1.metric("Cuenca de Monitoreo", "Río Cahabón (L8)")
-    m2.metric("Lluvia Máxima (Próx. 48h)", f"{precip_pronostico} mm")
-    m3.metric("Saturación Estimada (5 Días)", f"{saturacion_5d:.1f} mm")
+    m2.metric("Lluvia de Alerta (Día 1/2)", f"{precip_pronostico:.1f} mm")
+    m3.metric("Saturación Total (5 Días)", f"{saturacion_5d:.1f} mm")
     st.write("")
 
     col_mapa, col_grafico = st.columns([3, 2])
     
     with col_mapa:
-        # Mapa Seguro (A prueba de fallos)
         m = folium.Map(location=[lat_center, lon_center], zoom_start=10, tiles="CartoDB positron")
         def get_ee_url(ee_image, vis_params):
             try:
@@ -203,7 +251,8 @@ with tab1:
         st_folium(m, width="100%", height=480)
 
     with col_grafico:
-        st.markdown("<h4 style='text-align: center;'>🌧️ Pronóstico Extendido (5 Días)</h4>", unsafe_allow_html=True)
+        titulo_grafico = "Simulación Histórica (5 Días)" if es_simulacion else "Pronóstico Extendido (5 Días)"
+        st.markdown(f"<h4 style='text-align: center;'>🌧️ {titulo_grafico}</h4>", unsafe_allow_html=True)
         st.caption("Evalúa el impacto de la lluvia diaria y la lluvia acumulada (saturación).")
         
         if not df_pronostico.empty:
@@ -233,6 +282,10 @@ with tab1:
             )
             max_y = max(df_pronostico['Acumulado (mm)'].max(), umbral_roja) + 15
             fig_5d.update_yaxes(title_text="Precipitación (mm)", range=[0, max_y], secondary_y=False)
+            
+            # Formatear el eje X para que siempre se vea bien como fecha
+            fig_5d.update_xaxes(type='category', tickformat="%Y-%m-%d")
+            
             st.plotly_chart(fig_5d, use_container_width=True)
 
 # ----- PESTAÑA 2: HISTÓRICO Y DESCARGAS -----
@@ -242,7 +295,11 @@ with tab2:
         with c_agg1:
             agg_temporal = st.radio("Agregación Temporal de la Gráfica:", ["Diario", "Mensual", "Anual"], horizontal=True)
         
-        df_limpio = df_historico.rename(columns={'fecha': 'Fecha', 'lluvia_mm': 'Precipitación (mm)'})
+        # Transformar para graficar
+        df_limpio = df_historico.copy()
+        df_limpio['fecha'] = pd.to_datetime(df_limpio['fecha'])
+        df_limpio = df_limpio.rename(columns={'fecha': 'Fecha', 'lluvia_mm': 'Precipitación (mm)'})
+        
         if agg_temporal == "Diario":
             df_plot = df_limpio.copy()
         elif agg_temporal == "Mensual":
@@ -250,7 +307,7 @@ with tab2:
         elif agg_temporal == "Anual":
             df_plot = df_limpio.resample('YE', on='Fecha').sum().reset_index()
 
-        fig_ts = px.line(df_plot, x='Fecha', y='Precipitación (mm)', title=f"Registro Histórico {agg_temporal} (1981 - 2026)")
+        fig_ts = px.line(df_plot, x='Fecha', y='Precipitación (mm)', title=f"Registro Histórico {agg_temporal}")
         fig_ts.update_traces(line_color='#2E86C1')
         
         # Umbrales solo se muestran en la vista diaria
@@ -283,7 +340,7 @@ with tab2:
 # ----- PESTAÑA 3: PROTOCOLO OPERATIVO -----
 with tab3:
     st.subheader("🛡️ Protocolo de Actuación Municipal (CONRED)")
-    st.info(f"**Estado Actual del Sistema:** {estado}")
+    st.info(f"**Estado del Sistema:** {estado}")
     st.markdown(f"### Acción Recomendada:\n{protocolo}")
     
     st.divider()
@@ -303,8 +360,7 @@ with tab4:
     
     * **Motor Geoespacial:** Se utiliza la API de **Google Earth Engine** y librerías de Python en la nube para procesar y recortar el Modelo Digital de Elevación (DEM-SRTM).
     * **Análisis Estadístico:** Los umbrales de peligro (P90, P95, P99) fueron parametrizados extrayendo y promediando espacialmente **44 años de imágenes satelitales diarias** de la colección **CHIRPS v2.0** para la cuenca específica.
-    * **Pronóstico Inteligente (Ensemble):** El portal se conecta automáticamente a la API meteorológica de **Open-Meteo**. El pronóstico de 5 días resulta de un ensamble que selecciona el mejor modelo disponible entre el **GFS** (NOAA - Estados Unidos) y el **ICON** (DWD - Alemania) para las coordenadas centroides de la cuenca.
-    * **Saturación del Suelo:** La gráfica de pronóstico acumula la lluvia proyectada, permitiendo a los tomadores de decisiones visualizar no solo el peligro de un evento aislado, sino el riesgo por lluvia antecedente (saturación).
-    
-    *Nota para futuras iteraciones: Se recomienda incorporar datos dinámicos de humedad del suelo de la misión satelital SMAP.*
+    * **Modo En Vivo (Open-Meteo):** El portal se conecta a la API de Open-Meteo, extrayendo el ensamble de los modelos **GFS** (NOAA) e **ICON** (DWD) para las coordenadas centroides de la cuenca.
+    * **Modo Simulador Histórico:** Permite "viajar en el tiempo" seleccionando fechas del pasado para observar cómo se hubiera comportado el sistema durante tormentas históricas registradas en la base de datos CHIRPS.
+    * **Saturación del Suelo:** La gráfica de pronóstico/simulación acumula la lluvia progresiva, permitiendo a los tomadores de decisiones visualizar el riesgo de crecidas por saturación de humedad antecedente.
     """)
